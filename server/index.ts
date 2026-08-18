@@ -1,0 +1,299 @@
+import { randomUUID } from "node:crypto";
+import fs from "node:fs/promises";
+import path from "node:path";
+import cors from "cors";
+import cookieParser from "cookie-parser";
+import express, { type Response } from "express";
+import multer from "multer";
+import type { ResultSetHeader, RowDataPacket } from "mysql2";
+import { z } from "zod";
+import { citationsFrom, replaceDocumentChunks, retrieve, streamAnswer } from "./ai";
+import { clearSession, issueSession, requireAdmin, requireUser, verifyPassword } from "./auth";
+import { config } from "./config";
+import { countUsers, db, ensureDatabase } from "./db";
+import { extractText, isSupportedFile } from "./documents";
+import type { AuthedRequest, Provider, Role } from "./types";
+
+await fs.mkdir(config.uploadDir, { recursive: true });
+await ensureDatabase();
+
+const app = express();
+app.use(cors({ origin: true, credentials: true }));
+app.use(express.json({ limit: "1mb" }));
+app.use(cookieParser());
+
+const upload = multer({
+  storage: multer.diskStorage({
+    destination: (_req, _file, done) => done(null, config.uploadDir),
+    filename: (_req, file, done) => done(null, `${randomUUID()}${path.extname(file.originalname).toLowerCase()}`),
+  }),
+  limits: { fileSize: 25 * 1024 * 1024, files: 1 },
+  fileFilter: (_req, file, done) => done(null, isSupportedFile(file.originalname)),
+});
+
+function sendEvent(res: Response, type: string, data: unknown) {
+  res.write(`event: ${type}\ndata: ${JSON.stringify(data)}\n\n`);
+}
+
+async function audit(userId: number | null, action: string, targetType?: string, targetId?: string, detail?: unknown) {
+  await db.execute(
+    "INSERT INTO audit_logs (id, user_id, action, target_type, target_id, detail) VALUES (?, ?, ?, ?, ?, ?)",
+    [randomUUID(), userId, action, targetType ?? null, targetId ?? null, detail ? JSON.stringify(detail) : null],
+  );
+}
+
+async function ownedConversation(id: string, userId: number) {
+  const [rows] = await db.execute<RowDataPacket[]>("SELECT id FROM conversations WHERE id = ? AND user_id = ?", [id, userId]);
+  return rows.length > 0;
+}
+
+app.get("/api/health", (_req, res) => res.json({ ok: true }));
+
+app.get("/api/setup", async (_req, res, next) => {
+  try {
+    res.json({ needsSetup: (await countUsers()) === 0 });
+  } catch (error) { next(error); }
+});
+
+app.post("/api/setup", async (req, res, next) => {
+  try {
+    if ((await countUsers()) > 0) return res.status(409).json({ error: "系统已经初始化，请直接登录。" });
+    const input = z.object({ email: z.string().email(), password: z.string().min(10), displayName: z.string().min(1).max(100) }).parse(req.body);
+    const bcrypt = await import("bcryptjs");
+    const [result] = await db.execute<ResultSetHeader>(
+      "INSERT INTO users (email, display_name, password_hash, role) VALUES (?, ?, ?, 'admin')",
+      [input.email.toLowerCase(), input.displayName, await bcrypt.default.hash(input.password, 12)],
+    );
+    const user = { id: Number(result.insertId), email: input.email.toLowerCase(), displayName: input.displayName, role: "admin" as const };
+    issueSession(res, user);
+    await audit(user.id, "setup_complete", "user", String(user.id));
+    return res.status(201).json({ user });
+  } catch (error) { next(error); }
+});
+
+app.post("/api/auth/login", async (req, res, next) => {
+  try {
+    const input = z.object({ email: z.string().email(), password: z.string().min(1) }).parse(req.body);
+    const user = await verifyPassword(input.email, input.password);
+    if (!user) return res.status(401).json({ error: "邮箱或密码不正确。" });
+    issueSession(res, user);
+    await audit(user.id, "login", "user", String(user.id));
+    return res.json({ user });
+  } catch (error) { next(error); }
+});
+
+app.post("/api/auth/logout", requireUser, async (req: AuthedRequest, res, next) => {
+  try {
+    clearSession(res);
+    await audit(req.user!.id, "logout", "user", String(req.user!.id));
+    return res.status(204).end();
+  } catch (error) { next(error); }
+});
+
+app.get("/api/auth/me", requireUser, (req: AuthedRequest, res) => res.json({ user: req.user }));
+
+app.get("/api/conversations", requireUser, async (req: AuthedRequest, res, next) => {
+  try {
+    const [rows] = await db.execute<RowDataPacket[]>(
+      "SELECT id, title, created_at, updated_at FROM conversations WHERE user_id = ? ORDER BY updated_at DESC LIMIT 100",
+      [req.user!.id],
+    );
+    res.json({ conversations: rows });
+  } catch (error) { next(error); }
+});
+
+app.get("/api/conversations/:id", requireUser, async (req: AuthedRequest, res, next) => {
+  try {
+    const conversationId = String(req.params.id);
+    if (!(await ownedConversation(conversationId, req.user!.id))) return res.status(404).json({ error: "对话不存在。" });
+    const [messages] = await db.execute<RowDataPacket[]>(
+      "SELECT id, role, content, provider, citations, created_at FROM messages WHERE conversation_id = ? ORDER BY created_at ASC",
+      [conversationId],
+    );
+    res.json({ messages: messages.map((message) => ({ ...message, citations: message.citations ? JSON.parse(message.citations) : [] })) });
+  } catch (error) { next(error); }
+});
+
+app.post("/api/chat/stream", requireUser, async (req: AuthedRequest, res, next) => {
+  let streamOpen = false;
+  try {
+    const input = z.object({
+      question: z.string().min(2).max(4000),
+      conversationId: z.string().uuid().optional(),
+      provider: z.enum(["openai", "deepseek"]).default("openai"),
+    }).parse(req.body);
+    const userId = req.user!.id;
+    const conversationId = input.conversationId ?? randomUUID();
+    if (input.conversationId && !(await ownedConversation(conversationId, userId))) return res.status(404).json({ error: "对话不存在。" });
+    if (!input.conversationId) {
+      const title = input.question.replace(/\s+/g, " ").slice(0, 42);
+      await db.execute("INSERT INTO conversations (id, user_id, title) VALUES (?, ?, ?)", [conversationId, userId, title]);
+    }
+    await db.execute("INSERT INTO messages (id, conversation_id, role, content) VALUES (?, ?, 'user', ?)", [randomUUID(), conversationId, input.question]);
+    await db.execute("UPDATE conversations SET updated_at = CURRENT_TIMESTAMP WHERE id = ?", [conversationId]);
+
+    const context = await retrieve(input.question);
+    const [historyRows] = await db.execute<RowDataPacket[]>(
+      "SELECT role, content FROM messages WHERE conversation_id = ? ORDER BY created_at DESC LIMIT 8",
+      [conversationId],
+    );
+    const history = historyRows.reverse().slice(0, -1).map((message) => ({ role: message.role as "user" | "assistant", content: message.content }));
+
+    res.status(200).set({ "Content-Type": "text/event-stream", "Cache-Control": "no-cache, no-transform", Connection: "keep-alive" });
+    res.flushHeaders();
+    streamOpen = true;
+    sendEvent(res, "sources", { citations: citationsFrom(context) });
+    const answer = await streamAnswer(input.provider as Provider, input.question, history, context, (text) => sendEvent(res, "delta", { text }));
+    const messageId = randomUUID();
+    const citations = citationsFrom(context);
+    await db.execute(
+      "INSERT INTO messages (id, conversation_id, role, content, provider, citations) VALUES (?, ?, 'assistant', ?, ?, ?)",
+      [messageId, conversationId, answer, input.provider, JSON.stringify(citations)],
+    );
+    await db.execute("UPDATE conversations SET updated_at = CURRENT_TIMESTAMP WHERE id = ?", [conversationId]);
+    await audit(userId, "ask_question", "conversation", conversationId, { provider: input.provider, sources: citations.length });
+    sendEvent(res, "done", { conversationId, messageId, citations });
+    return res.end();
+  } catch (error) {
+    if (streamOpen) { sendEvent(res, "error", { error: error instanceof Error ? error.message : "生成回答失败。" }); return res.end(); }
+    return next(error);
+  }
+});
+
+app.post("/api/feedback", requireUser, async (req: AuthedRequest, res, next) => {
+  try {
+    const input = z.object({ messageId: z.string().uuid(), rating: z.enum(["up", "down"]), note: z.string().max(1000).optional() }).parse(req.body);
+    await db.execute(
+      "INSERT INTO feedback (id, message_id, user_id, rating, note) VALUES (?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE rating = VALUES(rating), note = VALUES(note)",
+      [randomUUID(), input.messageId, req.user!.id, input.rating, input.note ?? null],
+    );
+    await audit(req.user!.id, "feedback", "message", input.messageId, { rating: input.rating });
+    res.status(204).end();
+  } catch (error) { next(error); }
+});
+
+app.get("/api/documents/:id/download", requireUser, async (req: AuthedRequest, res, next) => {
+  try {
+    const [rows] = await db.execute<RowDataPacket[]>("SELECT filename, storage_path FROM documents WHERE id = ? AND status = 'ready'", [req.params.id]);
+    if (!rows[0]) return res.status(404).json({ error: "文件不存在。" });
+    return res.download(rows[0].storage_path, rows[0].filename);
+  } catch (error) { next(error); }
+});
+
+app.get("/api/admin/documents", requireUser, requireAdmin, async (_req: AuthedRequest, res, next) => {
+  try {
+    const [rows] = await db.query<RowDataPacket[]>(
+      `SELECT d.id, d.title, d.filename, d.mime_type, d.size_bytes, d.status, d.error_message, d.created_at, d.updated_at,
+       u.display_name AS uploader_name, COUNT(c.id) AS chunk_count
+       FROM documents d INNER JOIN users u ON u.id = d.uploaded_by LEFT JOIN document_chunks c ON c.document_id = d.id
+       GROUP BY d.id ORDER BY d.updated_at DESC`,
+    );
+    res.json({ documents: rows });
+  } catch (error) { next(error); }
+});
+
+app.post("/api/admin/documents", requireUser, requireAdmin, upload.single("file"), async (req: AuthedRequest, res, next) => {
+  const file = req.file;
+  try {
+    if (!file) return res.status(400).json({ error: "请选择 PDF、DOCX、XLSX、XLS 或 TXT 文件。" });
+    const content = (await extractText(file.path, file.originalname)).trim();
+    if (content.length < 20) throw new Error("未能从文件中提取足够文本；请确认文件不是扫描图片或受密码保护。" );
+    const id = randomUUID();
+    const title = path.basename(file.originalname, path.extname(file.originalname));
+    await db.execute(
+      "INSERT INTO documents (id, title, filename, mime_type, storage_path, content, size_bytes, status, uploaded_by) VALUES (?, ?, ?, ?, ?, ?, ?, 'processing', ?)",
+      [id, title, file.originalname, file.mimetype || "application/octet-stream", file.path, content, file.size, req.user!.id],
+    );
+    const chunks = await replaceDocumentChunks(id, content);
+    await audit(req.user!.id, "upload_document", "document", id, { filename: file.originalname, chunks });
+    res.status(201).json({ document: { id, title, filename: file.originalname, chunks, status: "ready" } });
+  } catch (error) {
+    if (file) await fs.unlink(file.path).catch(() => undefined);
+    next(error);
+  }
+});
+
+app.post("/api/admin/documents/:id/reindex", requireUser, requireAdmin, async (req: AuthedRequest, res, next) => {
+  try {
+    const documentId = String(req.params.id);
+    const [rows] = await db.execute<RowDataPacket[]>("SELECT content FROM documents WHERE id = ?", [documentId]);
+    if (!rows[0]) return res.status(404).json({ error: "文档不存在。" });
+    await db.execute("UPDATE documents SET status = 'processing', error_message = NULL WHERE id = ?", [documentId]);
+    const chunks = await replaceDocumentChunks(documentId, rows[0].content);
+    await audit(req.user!.id, "reindex_document", "document", documentId, { chunks });
+    res.json({ chunks });
+  } catch (error) {
+    await db.execute("UPDATE documents SET status = 'failed', error_message = ? WHERE id = ?", [error instanceof Error ? error.message : "索引失败", String(req.params.id)]);
+    next(error);
+  }
+});
+
+app.delete("/api/admin/documents/:id", requireUser, requireAdmin, async (req: AuthedRequest, res, next) => {
+  try {
+    const documentId = String(req.params.id);
+    const [rows] = await db.execute<RowDataPacket[]>("SELECT storage_path FROM documents WHERE id = ?", [documentId]);
+    if (!rows[0]) return res.status(404).json({ error: "文档不存在。" });
+    await db.execute("DELETE FROM documents WHERE id = ?", [documentId]);
+    await fs.unlink(rows[0].storage_path).catch(() => undefined);
+    await audit(req.user!.id, "delete_document", "document", documentId);
+    res.status(204).end();
+  } catch (error) { next(error); }
+});
+
+app.get("/api/admin/users", requireUser, requireAdmin, async (_req: AuthedRequest, res, next) => {
+  try {
+    const [rows] = await db.query<RowDataPacket[]>("SELECT id, email, display_name, role, is_active, created_at FROM users ORDER BY created_at ASC");
+    res.json({ users: rows });
+  } catch (error) { next(error); }
+});
+
+app.post("/api/admin/users", requireUser, requireAdmin, async (req: AuthedRequest, res, next) => {
+  try {
+    const input = z.object({ email: z.string().email(), displayName: z.string().min(1).max(100), password: z.string().min(10), role: z.enum(["employee", "admin"]).default("employee") }).parse(req.body);
+    const bcrypt = await import("bcryptjs");
+    const [result] = await db.execute<ResultSetHeader>(
+      "INSERT INTO users (email, display_name, password_hash, role) VALUES (?, ?, ?, ?)",
+      [input.email.toLowerCase(), input.displayName, await bcrypt.default.hash(input.password, 12), input.role],
+    );
+    await audit(req.user!.id, "create_user", "user", String(result.insertId), { role: input.role });
+    res.status(201).json({ id: Number(result.insertId) });
+  } catch (error) { next(error); }
+});
+
+app.patch("/api/admin/users/:id", requireUser, requireAdmin, async (req: AuthedRequest, res, next) => {
+  try {
+    const input = z.object({ role: z.enum(["employee", "admin"]).optional(), isActive: z.boolean().optional() }).refine((value) => value.role !== undefined || value.isActive !== undefined).parse(req.body);
+    const id = z.coerce.number().int().positive().parse(req.params.id);
+    if (id === req.user!.id && input.isActive === false) return res.status(400).json({ error: "不能停用当前登录的管理员。" });
+    if (input.role !== undefined) await db.execute("UPDATE users SET role = ? WHERE id = ?", [input.role as Role, id]);
+    if (input.isActive !== undefined) await db.execute("UPDATE users SET is_active = ? WHERE id = ?", [input.isActive, id]);
+    await audit(req.user!.id, "update_user", "user", String(id), input);
+    res.status(204).end();
+  } catch (error) { next(error); }
+});
+
+app.get("/api/admin/audit", requireUser, requireAdmin, async (_req: AuthedRequest, res, next) => {
+  try {
+    const [rows] = await db.query<RowDataPacket[]>(
+      `SELECT a.id, a.action, a.target_type, a.target_id, a.detail, a.created_at, u.display_name AS user_name, u.email AS user_email
+       FROM audit_logs a LEFT JOIN users u ON u.id = a.user_id ORDER BY a.created_at DESC LIMIT 200`,
+    );
+    res.json({ logs: rows.map((row) => ({ ...row, detail: row.detail ? JSON.parse(row.detail) : null })) });
+  } catch (error) { next(error); }
+});
+
+if (process.env.NODE_ENV === "production") {
+  app.use(express.static(path.resolve("dist")));
+  app.use((_req, res) => res.sendFile(path.resolve("dist/index.html")));
+}
+
+app.use((error: unknown, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+  void _next;
+  console.error(error);
+  if (error instanceof z.ZodError) return res.status(400).json({ error: error.issues[0]?.message ?? "请求参数不正确。" });
+  if (error instanceof multer.MulterError) return res.status(400).json({ error: `上传失败：${error.message}` });
+  const message = error instanceof Error ? error.message : "服务器发生未知错误。";
+  return res.status(500).json({ error: message });
+});
+
+app.listen(config.PORT, () => console.log(`知问 API 已启动：http://localhost:${config.PORT}`));

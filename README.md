@@ -1,98 +1,28 @@
 # 知问 · 内部 AI 知识助手
 
-内部知识问答工具的前端原型，提供权限提示、来源可追溯的回答、会话列表和建议问题。
+本地运行的内部知识问答系统，支持普通员工和管理员账号、MySQL 数据管理、资料上传、向量检索、带引用的问答、会话历史、反馈和审计记录。
 
-## Prerequisites
-
-- Node.js `>=22.13.0`
-
-## Quick Start
+## 开始使用
 
 ```bash
 npm install
+cp .env.example .env
+# 编辑 .env，填写 MYSQL_URL、JWT_SECRET、OPENAI_API_KEY、DEEPSEEK_API_KEY
+docker compose up -d mysql # 如已有 MySQL，可跳过此步骤
+npm run db:init
 npm run dev
-npm run build
 ```
 
-This starter does not use `wrangler.jsonc`.
+浏览器打开 `http://localhost:3000`。首次启动可用 `.env` 中的 `ADMIN_*` 自动创建管理员；若未填写，也可在登录页创建第一个管理员。
 
-## Included Shape
+## 主要能力
 
-- edit site code under `app/`
-- `.openai/hosting.json` declares optional Sites D1 and R2 bindings
-- `vite.config.ts` simulates declared bindings for local development
-- `db/schema.ts` starts intentionally empty
-- `examples/d1/` contains an optional D1 example surface
-- `drizzle.config.ts` supports local migration generation when needed
+- 管理员与普通员工两种角色，以及 HTTP-only 会话登录。
+- PDF、DOCX、XLSX/XLS 和 TXT 本地上传、文本解析和索引。
+- 使用 OpenAI Embedding 生成向量，在 MySQL 中保存知识片段与向量。
+- 向量相似度与关键词融合的本地重排序；问答可选择 OpenAI 或 DeepSeek。
+- 流式回答、来源引用下载、会话历史、回答反馈和审计记录。
 
-## Workspace Auth Headers
+上传文件保存在 `uploads/`，MySQL 保存全部业务数据。密钥只应存入本地 `.env`，不要提交到 Git。
 
-Signed-in visitors receive both `oai-authenticated-user-id` and `oai-authenticated-user-email`. Private Sites require every visitor to sign in; public Sites may also have anonymous visitors, for whom neither header is present.
-
-The user ID is stable for the same user on the same Site and different across Sites. Email and name are intended for display or contact purposes.
-
-SIWC-authenticated workspace sites may also receive
-`oai-authenticated-user-full-name` when the user's SIWC profile has a non-empty
-`name` claim. The full-name value is percent-encoded UTF-8 and is accompanied by
-`oai-authenticated-user-full-name-encoding: percent-encoded-utf-8`.
-
-Treat the full name as optional and fall back to email when it is absent:
-
-```tsx
-import { headers } from "next/headers";
-
-export default async function Home() {
-  const requestHeaders = await headers();
-  const userId = requestHeaders.get("oai-authenticated-user-id");
-  const email = requestHeaders.get("oai-authenticated-user-email");
-  const encodedFullName = requestHeaders.get("oai-authenticated-user-full-name");
-  const fullName =
-    encodedFullName &&
-    requestHeaders.get("oai-authenticated-user-full-name-encoding") ===
-      "percent-encoded-utf-8"
-      ? decodeURIComponent(encodedFullName)
-      : null;
-
-  const displayName = fullName ?? email;
-  // ...
-}
-```
-
-## Optional Dispatch-Owned ChatGPT Sign-In
-
-Import the ready-to-use helpers from `app/chatgpt-auth.ts` when the site needs
-optional or required ChatGPT sign-in:
-
-- Use `getChatGPTUser()` for optional signed-in UI.
-- Use `requireChatGPTUser(returnTo)` for server-rendered pages that should send
-  anonymous visitors through Sign in with ChatGPT.
-- Use `chatGPTSignInPath(returnTo)` and `chatGPTSignOutPath(returnTo)` for
-  browser links or actions.
-- Pass a same-origin relative `returnTo` path for the destination after sign-in
-  or sign-out. The helper validates and safely encodes it.
-- Mark protected pages with `export const dynamic = "force-dynamic"` because
-  they depend on per-request identity headers.
-
-Dispatch owns `/signin-with-chatgpt`, `/signout-with-chatgpt`, `/callback`, the
-OAuth cookies, and identity header injection. Do not implement app routes for
-those reserved paths. Routes that do not import and call the helper remain
-anonymous-compatible.
-
-SIWC establishes identity only; it does not prove workspace membership. Use the
-Sites hosting platform's access policy controls for workspace-wide restrictions,
-or enforce explicit server-side membership or allowlist checks.
-
-Use SIWC for account pages, user-specific dashboards, saved records, and write
-actions tied to the current ChatGPT user. Leave public content anonymous.
-
-## Useful Commands
-
-- `npm run dev`: start local development
-- `npm run build`: verify the vinext build output
-- `npm test`: build the starter and verify its rendered loading skeleton
-- `npm run db:generate`: generate Drizzle migrations after schema changes
-
-## Learn More
-
-- [vinext Documentation](https://github.com/cloudflare/vinext)
-- [Drizzle D1 Guide](https://orm.drizzle.team/docs/get-started/d1-new)
+如果使用随项目提供的 MySQL 容器，请让 `MYSQL_URL` 内的用户名、密码和数据库名与 `MYSQL_USER`、`MYSQL_PASSWORD`、`MYSQL_DATABASE` 保持一致。
