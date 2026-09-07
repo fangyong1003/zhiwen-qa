@@ -1,7 +1,7 @@
 import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 
 type Role = "employee" | "admin";
-type Provider = "openai" | "deepseek";
+type Provider = "openai" | "deepseek" | "gemini";
 type User = { id: number; email: string; displayName: string; role: Role };
 type Citation = { documentId: string; title: string; filename: string; chunkIndex: number; excerpt: string; score: number };
 type Message = { id: string; role: "user" | "assistant"; content: string; citations?: Citation[]; created_at?: string; pending?: boolean };
@@ -34,7 +34,7 @@ export default function App() {
   const [activeConversation, setActiveConversation] = useState<string | null>(null);
   const [messages, setMessages] = useState<Message[]>([]);
   const [question, setQuestion] = useState("");
-  const [provider, setProvider] = useState<Provider>("openai");
+  const [provider, setProvider] = useState<Provider>("gemini");
   const [sending, setSending] = useState(false);
   const [documents, setDocuments] = useState<DocumentItem[]>([]);
   const [staff, setStaff] = useState<Staff[]>([]);
@@ -74,7 +74,7 @@ export default function App() {
   async function loadStaff() { try { setStaff((await api<{ users: Staff[] }>("/api/admin/users")).users); } catch (reason) { setError(reason instanceof Error ? reason.message : "无法读取成员。"); } }
   async function loadAudits() { try { setAudits((await api<{ logs: Audit[] }>("/api/admin/audit")).logs); } catch (reason) { setError(reason instanceof Error ? reason.message : "无法读取审计记录。"); } }
 
-  function newChat() { setActiveConversation(null); setMessages([]); setQuestion(""); setView("chat"); setError(""); }
+  function newChat() { setActiveConversation(null); setMessages([]); setQuestion(""); setProvider("gemini"); setView("chat"); setError(""); }
   async function sendQuestion(event: FormEvent) {
     event.preventDefault();
     const text = question.trim();
@@ -134,7 +134,7 @@ function AuthScreen({ needsSetup, onDone }: { needsSetup: boolean; onDone: (user
 
 function ChatView({ messages, question, setQuestion, provider, setProvider, sending, sendQuestion, onRate }: { messages: Message[]; question: string; setQuestion: (value: string) => void; provider: Provider; setProvider: (value: Provider) => void; sending: boolean; sendQuestion: (event: FormEvent) => void; onRate: (id: string, value: "up" | "down") => void }) {
   const empty = messages.length === 0;
-  return <div className="chat-view">{empty && <div className="chat-intro"><p className="kicker">公司知识，一问即得</p><h1>今天想弄清楚什么？</h1><p>回答基于公司共享知识库，并且提供来源供你核验。</p></div>}<div className="thread">{messages.map((message) => <article key={message.id} className={`message ${message.role}`}><div className="message-label">{message.role === "user" ? "你" : <><Spark /> 知问回答</>}</div>{message.pending && !message.content ? <div className="typing"><i /><i /><i /></div> : <div className="message-content">{message.content}</div>}{message.role === "assistant" && !message.pending && <><div className="message-actions"><button onClick={() => void onRate(message.id, "up")}>✓ 有帮助</button><button onClick={() => void onRate(message.id, "down")}>× 不准确</button><button onClick={() => navigator.clipboard.writeText(message.content)}>复制</button></div>{message.citations?.length ? <div className="citations"><p>参考来源</p>{message.citations.map((item, index) => <a key={`${item.documentId}-${item.chunkIndex}`} href={`/api/documents/${item.documentId}/download`}><b>[{index + 1}]</b><span>{item.title}<small>{item.excerpt}</small></span><em>↗</em></a>)}</div> : null}</>}</article>)}</div><form className="composer" onSubmit={sendQuestion}><textarea value={question} onChange={(event) => setQuestion(event.target.value)} placeholder="例如：差旅费用报销的标准流程是什么？" rows={3} disabled={sending} /><div><span>⌁ 检索公司共享知识库</span><label className="provider">模型<select value={provider} onChange={(event) => setProvider(event.target.value as Provider)}><option value="openai">OpenAI</option><option value="deepseek">DeepSeek</option></select></label><button className="send" disabled={!question.trim() || sending} type="submit">{sending ? "生成中…" : "发送 ↑"}</button></div></form></div>;
+  return <div className="chat-view">{empty && <div className="chat-intro"><p className="kicker">公司知识，一问即得</p><h1>今天想弄清楚什么？</h1><p>回答基于公司共享知识库，并且提供来源供你核验。</p></div>}<div className="thread">{messages.map((message) => <article key={message.id} className={`message ${message.role}`}><div className="message-label">{message.role === "user" ? "你" : <><Spark /> 知问回答</>}</div>{message.pending && !message.content ? <div className="typing"><i /><i /><i /></div> : <div className="message-content">{message.content}</div>}{message.role === "assistant" && !message.pending && <><div className="message-actions"><button onClick={() => void onRate(message.id, "up")}>✓ 有帮助</button><button onClick={() => void onRate(message.id, "down")}>× 不准确</button><button onClick={() => navigator.clipboard.writeText(message.content)}>复制</button></div>{message.citations?.length ? <div className="citations"><p>参考来源</p>{message.citations.map((item, index) => <a key={`${item.documentId}-${item.chunkIndex}`} href={`/api/documents/${item.documentId}/download`}><b>[{index + 1}]</b><span>{item.title}<small>{item.excerpt}</small></span><em>↗</em></a>)}</div> : null}</>}</article>)}</div><form className="composer" onSubmit={sendQuestion}><textarea value={question} onChange={(event) => setQuestion(event.target.value)} placeholder="例如：差旅费用报销的标准流程是什么？" rows={3} disabled={sending} /><div><span>⌁ 检索公司共享知识库</span><label className="provider">模型<select value={provider} onChange={(event) => setProvider(event.target.value as Provider)}><option value="gemini">Gemini</option><option value="openai">OpenAI</option><option value="deepseek">DeepSeek</option></select></label><button className="send" disabled={!question.trim() || sending} type="submit">{sending ? "生成中…" : "发送 ↑"}</button></div></form></div>;
 }
 
 function DocumentsView({ documents, fileRef, uploadDocument, deleteDocument, reindexDocument }: { documents: DocumentItem[]; fileRef: React.RefObject<HTMLInputElement | null>; uploadDocument: (file: File) => void; deleteDocument: (id: string) => void; reindexDocument: (id: string) => void }) {

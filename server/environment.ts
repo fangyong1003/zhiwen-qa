@@ -20,6 +20,9 @@ export function readEnvironment(values: NodeJS.ProcessEnv) {
     OPENAI_EMBEDDING_MODEL: z.preprocess(emptyToUndefined, z.string().default("text-embedding-3-small")),
     DEEPSEEK_API_KEY: optionalString,
     DEEPSEEK_CHAT_MODEL: z.preprocess(emptyToUndefined, z.string().default("deepseek-v4-flash")),
+    GEMINI_API_KEY: optionalString,
+    GEMINI_CHAT_MODEL: z.preprocess(emptyToUndefined, z.string().default("gemini-3.8-flash")),
+    GEMINI_BASE_URL: z.preprocess(emptyToUndefined, z.url().refine((value) => ["http:", "https:"].includes(new URL(value).protocol), "GEMINI_BASE_URL must be an HTTP(S) URL").optional()),
   }).superRefine((env, context) => {
     if (Boolean(env.ADMIN_EMAIL) !== Boolean(env.ADMIN_PASSWORD)) {
       context.addIssue({ code: "custom", path: [env.ADMIN_EMAIL ? "ADMIN_PASSWORD" : "ADMIN_EMAIL"], message: "ADMIN_EMAIL and ADMIN_PASSWORD must be configured together" });

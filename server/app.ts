@@ -118,7 +118,7 @@ app.post("/api/chat/stream", requireUser, async (req: AuthedRequest, res, next) 
     const input = z.object({
       question: z.string().min(2).max(4000),
       conversationId: z.string().uuid().optional(),
-      provider: z.enum(["openai", "deepseek"]).default("openai"),
+      provider: z.enum(["openai", "deepseek", "gemini"]).default("gemini"),
     }).parse(req.body);
     assertChatConfigured(input.provider);
     const userId = req.user!.id;

@@ -5,6 +5,7 @@ import { config } from "./config";
 import { db } from "./db";
 import type { Citation, Provider } from "./types";
 import { splitText } from "./chunks";
+import { streamGeminiAnswer } from "./gemini";
 
 type ChunkRow = RowDataPacket & {
   id: string;
@@ -27,6 +28,7 @@ function deepSeekClient() {
 }
 
 export function assertChatConfigured(provider: Provider) {
+  if (provider === "gemini" && !config.GEMINI_API_KEY) throw new Error("尚未配置 GEMINI_API_KEY。请在 .env 中添加后重启服务。");
   if (provider === "deepseek" && !config.DEEPSEEK_API_KEY) throw new Error("尚未配置 DEEPSEEK_API_KEY。请在 .env 中添加后重启服务。");
   if (!config.OPENAI_API_KEY) throw new Error("知识库检索需要 OPENAI_API_KEY。请在 .env 中添加后重启服务。");
 }
@@ -107,6 +109,12 @@ export async function streamAnswer(
   onDelta: (text: string) => void,
 ) {
   const instructions = systemPrompt(context);
+  if (provider === "gemini") {
+    return streamGeminiAnswer(
+      { apiKey: config.GEMINI_API_KEY, model: config.GEMINI_CHAT_MODEL, baseUrl: config.GEMINI_BASE_URL },
+      question, history, instructions, onDelta,
+    );
+  }
   if (provider === "openai") {
     const stream = await openAIClient().responses.create({
       model: config.OPENAI_CHAT_MODEL,

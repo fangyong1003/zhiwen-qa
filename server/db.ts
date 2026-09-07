@@ -63,7 +63,7 @@ const schema = [
     conversation_id CHAR(36) NOT NULL,
     role ENUM('user', 'assistant') NOT NULL,
     content MEDIUMTEXT NOT NULL,
-    provider ENUM('openai', 'deepseek') NULL,
+    provider ENUM('openai', 'deepseek', 'gemini') NULL,
     citations JSON NULL,
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     CONSTRAINT fk_messages_conversation FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE,
@@ -97,6 +97,10 @@ const schema = [
 
 export async function ensureDatabase() {
   for (const statement of schema) await db.query(statement);
+  const [providerColumns] = await db.query<RowDataPacket[]>("SHOW COLUMNS FROM messages LIKE 'provider'");
+  if (providerColumns[0].Type === "enum('openai','deepseek')") {
+    await db.query("ALTER TABLE messages MODIFY COLUMN provider ENUM('openai', 'deepseek', 'gemini') NULL");
+  }
   const [sequenceColumns] = await db.query<RowDataPacket[]>("SHOW COLUMNS FROM messages LIKE 'sequence_no'");
   if (!sequenceColumns.length) {
     try {

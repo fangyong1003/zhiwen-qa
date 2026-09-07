@@ -1,7 +1,7 @@
 import type { Request } from "express";
 
 export type Role = "employee" | "admin";
-export type Provider = "openai" | "deepseek";
+export type Provider = "openai" | "deepseek" | "gemini";
 
 export interface AppUser {
   id: number;
