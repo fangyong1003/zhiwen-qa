@@ -10,6 +10,8 @@
     "build": "tsc --noEmit && vite build",
     "start": "NODE_ENV=production tsx server/index.ts",
     "lint": "eslint . --ignore-pattern dist",
+    "test": "node --import tsx --test tests/unit/*.test.mjs",
+    "check": "npm run lint && npm test && npm run build",
     "db:init": "tsx server/init-db.ts"
   },
   "dependencies": {

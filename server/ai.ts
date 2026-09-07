@@ -4,6 +4,7 @@ import type { RowDataPacket } from "mysql2";
 import { config } from "./config";
 import { db } from "./db";
 import type { Citation, Provider } from "./types";
+import { splitText } from "./chunks";
 
 type ChunkRow = RowDataPacket & {
   id: string;
@@ -15,24 +16,6 @@ type ChunkRow = RowDataPacket & {
   filename: string;
 };
 
-export function splitText(input: string, chunkSize = 1000, overlap = 160) {
-  const clean = input.replace(/\r/g, "").replace(/\n{3,}/g, "\n\n").trim();
-  const chunks: string[] = [];
-  let cursor = 0;
-  while (cursor < clean.length) {
-    let end = Math.min(clean.length, cursor + chunkSize);
-    if (end < clean.length) {
-      const naturalBreak = Math.max(clean.lastIndexOf("\n", end), clean.lastIndexOf("。", end), clean.lastIndexOf(" ", end));
-      if (naturalBreak > cursor + Math.floor(chunkSize * 0.55)) end = naturalBreak + 1;
-    }
-    const chunk = clean.slice(cursor, end).trim();
-    if (chunk) chunks.push(chunk);
-    cursor = Math.max(end, cursor + 1) - overlap;
-    if (cursor < 0) cursor = 0;
-  }
-  return chunks;
-}
-
 function openAIClient() {
   if (!config.OPENAI_API_KEY) throw new Error("尚未配置 OPENAI_API_KEY；知识库索引需要 OpenAI Embedding 模型。");
   return new OpenAI({ apiKey: config.OPENAI_API_KEY });
@@ -41,6 +24,11 @@ function openAIClient() {
 function deepSeekClient() {
   if (!config.DEEPSEEK_API_KEY) throw new Error("尚未配置 DEEPSEEK_API_KEY。请在 .env 中添加后重启服务。");
   return new OpenAI({ apiKey: config.DEEPSEEK_API_KEY, baseURL: "https://api.deepseek.com" });
+}
+
+export function assertChatConfigured(provider: Provider) {
+  if (provider === "deepseek" && !config.DEEPSEEK_API_KEY) throw new Error("尚未配置 DEEPSEEK_API_KEY。请在 .env 中添加后重启服务。");
+  if (!config.OPENAI_API_KEY) throw new Error("知识库检索需要 OPENAI_API_KEY。请在 .env 中添加后重启服务。");
 }
 
 export async function createEmbeddings(texts: string[]) {

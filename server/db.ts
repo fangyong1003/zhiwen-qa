@@ -59,6 +59,7 @@ const schema = [
   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
   `CREATE TABLE IF NOT EXISTS messages (
     id CHAR(36) NOT NULL PRIMARY KEY,
+    sequence_no BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
     conversation_id CHAR(36) NOT NULL,
     role ENUM('user', 'assistant') NOT NULL,
     content MEDIUMTEXT NOT NULL,
@@ -66,7 +67,8 @@ const schema = [
     citations JSON NULL,
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     CONSTRAINT fk_messages_conversation FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE,
-    INDEX idx_messages_conversation_created (conversation_id, created_at)
+    UNIQUE KEY uq_messages_sequence (sequence_no),
+    INDEX idx_messages_conversation_created (conversation_id, created_at, sequence_no)
   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
   `CREATE TABLE IF NOT EXISTS feedback (
     id CHAR(36) NOT NULL PRIMARY KEY,
@@ -95,6 +97,15 @@ const schema = [
 
 export async function ensureDatabase() {
   for (const statement of schema) await db.query(statement);
+  const [sequenceColumns] = await db.query<RowDataPacket[]>("SHOW COLUMNS FROM messages LIKE 'sequence_no'");
+  if (!sequenceColumns.length) {
+    try {
+      await db.query("ALTER TABLE messages ADD COLUMN sequence_no BIGINT UNSIGNED NOT NULL AUTO_INCREMENT, ADD UNIQUE KEY uq_messages_sequence (sequence_no)");
+    } catch (error) {
+      // Another starting process may have applied the same atomic migration already.
+      if (!(error instanceof Error && "code" in error && error.code === "ER_DUP_FIELDNAME")) throw error;
+    }
+  }
   const [rows] = await db.query<RowDataPacket[]>("SELECT COUNT(*) AS count FROM users");
   if (Number(rows[0].count) === 0 && config.ADMIN_EMAIL && config.ADMIN_PASSWORD) {
     const passwordHash = await bcrypt.hash(config.ADMIN_PASSWORD, 12);
@@ -112,6 +123,14 @@ export async function appUserByEmail(email: string) {
     [email.toLowerCase()],
   );
   return rows[0] as (RowDataPacket & { password_hash: string; is_active: number }) | undefined;
+}
+
+export async function appUserById(id: number) {
+  const [rows] = await db.execute<RowDataPacket[]>(
+    "SELECT id, email, display_name, role, is_active FROM users WHERE id = ? LIMIT 1",
+    [id],
+  );
+  return rows[0];
 }
 
 export function toAppUser(row: RowDataPacket): AppUser {

@@ -1,8 +1,12 @@
 import fs from "node:fs/promises";
+import { createRequire } from "node:module";
 import path from "node:path";
 import mammoth from "mammoth";
-import pdfParse from "pdf-parse";
 import * as XLSX from "xlsx";
+
+// pdf-parse 1.x runs a bundled demo without a CommonJS parent. Load it as a library.
+const loadCommonJS = createRequire(import.meta.url);
+const pdfParse = loadCommonJS("pdf-parse") as (bytes: Uint8Array) => ReturnType<typeof import("pdf-parse")>;
 
 const supportedExtensions = new Set([".pdf", ".docx", ".xlsx", ".xls", ".txt"]);
 
@@ -14,7 +18,11 @@ export async function extractText(filePath: string, filename: string) {
   const buffer = await fs.readFile(filePath);
   const ext = path.extname(filename).toLowerCase();
   if (ext === ".txt") return buffer.toString("utf8");
-  if (ext === ".pdf") return (await pdfParse(buffer)).text;
+  if (ext === ".pdf") {
+    // PDF.js 1.x clones typed arrays using their constructor; Node Buffer can then
+    // introduce a pooled backing store. A plain Uint8Array keeps PDF offsets intact.
+    return (await pdfParse(new Uint8Array(buffer))).text;
+  }
   if (ext === ".docx") return (await mammoth.extractRawText({ buffer })).value;
   if (ext === ".xlsx" || ext === ".xls") {
     const workbook = XLSX.read(buffer, { type: "buffer" });

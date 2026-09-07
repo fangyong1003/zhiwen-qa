@@ -2,7 +2,7 @@ import bcrypt from "bcryptjs";
 import type { NextFunction, Response } from "express";
 import jwt from "jsonwebtoken";
 import { config } from "./config";
-import { appUserByEmail, toAppUser } from "./db";
+import { appUserByEmail, appUserById, toAppUser } from "./db";
 import type { AppUser, AuthedRequest } from "./types";
 
 const COOKIE_NAME = "zhiwen_session";
@@ -21,15 +21,30 @@ export function clearSession(response: Response) {
   response.clearCookie(COOKIE_NAME, { httpOnly: true, sameSite: "lax", secure: process.env.NODE_ENV === "production" });
 }
 
-export function requireUser(req: AuthedRequest, res: Response, next: NextFunction) {
+export async function requireUser(req: AuthedRequest, res: Response, next: NextFunction) {
   const authorization = req.header("authorization");
   const token = req.cookies?.[COOKIE_NAME] ?? (authorization?.startsWith("Bearer ") ? authorization.slice(7) : undefined);
   if (!token) return res.status(401).json({ error: "请先登录" });
+  let userId: number;
   try {
-    req.user = jwt.verify(token, config.JWT_SECRET) as AppUser;
-    return next();
+    const payload = jwt.verify(token, config.JWT_SECRET, { algorithms: ["HS256"] });
+    if (typeof payload === "string" || !Number.isSafeInteger(payload.id) || payload.id <= 0) {
+      return res.status(401).json({ error: "登录凭证无效，请重新登录" });
+    }
+    userId = payload.id;
   } catch {
     return res.status(401).json({ error: "登录已过期，请重新登录" });
+  }
+  try {
+    const row = await appUserById(userId);
+    if (!row || !row.is_active) {
+      clearSession(res);
+      return res.status(401).json({ error: "账号已停用或不存在，请联系管理员" });
+    }
+    req.user = toAppUser(row);
+    return next();
+  } catch (error) {
+    return next(error);
   }
 }
 
