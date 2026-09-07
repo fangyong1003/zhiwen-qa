@@ -11,6 +11,8 @@
     "start": "NODE_ENV=production tsx server/index.ts",
     "lint": "eslint . --ignore-pattern dist",
     "test": "node --import tsx --test tests/unit/*.test.mjs",
+    "test:integration": "node --import tsx --test tests/integration/*.test.mjs",
+    "test:integration:local": "node scripts/test-with-mysql.mjs",
     "check": "npm run lint && npm test && npm run build",
     "db:init": "tsx server/init-db.ts"
   },
