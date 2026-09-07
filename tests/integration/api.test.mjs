@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { randomBytes, randomUUID } from "node:crypto";
 import { once } from "node:events";
 import fs from "node:fs/promises";
@@ -8,6 +8,7 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { promisify } from "node:util";
 import mysql from "mysql2/promise";
 import { geminiEmbeddingResponse, geminiResponse } from "../helpers/gemini.mjs";
 
@@ -180,6 +181,84 @@ test("MySQL-backed knowledge QA API", { timeout: 90000 }, async (t) => {
     assert.equal((await fetch(`http://127.0.0.1:${port}/api/health`, { signal: AbortSignal.timeout(5000) })).status, 200);
     child.kill("SIGTERM");
     assert.equal((await exited)[0], 0);
+  });
+
+  await t.test("one-click launcher creates its database, starts both services, reuses them and cleans up only its children", async (subtest) => {
+    const workspace = path.join(uploadDir, "launcher fixture");
+    const launcherDatabase = `zhiwen_test_launcher_${randomUUID().replaceAll("-", "")}`;
+    const launcherEndpoint = new URL(endpoint);
+    launcherEndpoint.pathname = `/${launcherDatabase}`;
+    let child;
+    let exited;
+    async function stopLauncher() {
+      if (child && child.exitCode === null && child.signalCode === null) {
+        child.kill("SIGTERM");
+        const timer = setTimeout(() => child.kill("SIGKILL"), 10000);
+        timer.unref();
+        try { await exited; } finally { clearTimeout(timer); }
+      }
+    }
+    subtest.after(async () => {
+      await stopLauncher();
+      await bootstrap.query(`DROP DATABASE IF EXISTS \`${launcherDatabase}\``);
+      await fs.rm(workspace, { recursive: true, force: true });
+    });
+    await fs.mkdir(workspace);
+    for (const file of ["start.sh", "server", "app", "index.html", "vite.config.ts", "tsconfig.json", "package.json"]) {
+      await fs.cp(path.resolve(file), path.join(workspace, file), { recursive: true });
+    }
+    await fs.symlink(path.resolve("node_modules"), path.join(workspace, "node_modules"), "dir");
+    await fs.writeFile(path.join(workspace, ".env"), "# Isolated launcher test; configuration is inherited from the test process.\n");
+    const reservations = [net.createServer(), net.createServer()];
+    for (const server of reservations) { server.listen(0, "127.0.0.1"); await once(server, "listening"); }
+    const [apiPort, webPort] = reservations.map((server) => server.address().port);
+    for (const server of reservations) await new Promise((resolve) => server.close(resolve));
+    const options = {
+      cwd: os.tmpdir(),
+      env: { ...process.env, PORT: String(apiPort), WEB_PORT: String(webPort), MYSQL_URL: launcherEndpoint.toString(), UPLOAD_DIR: path.join(workspace, "uploads"), CI: "true" },
+    };
+    const script = path.join(workspace, "start.sh");
+    child = spawn("bash", [script], { ...options, stdio: ["ignore", "pipe", "pipe"] });
+    exited = once(child, "exit");
+    let output = "";
+    let errors = "";
+    child.stderr.on("data", (data) => { errors += data; });
+    await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error(`Launcher startup timed out: ${output}\n${errors}`)), 25000);
+      child.on("error", (error) => { clearTimeout(timer); reject(error); });
+      child.on("exit", (code) => { clearTimeout(timer); reject(new Error(`Launcher exited ${code}: ${output}\n${errors}`)); });
+      child.stdout.on("data", (data) => {
+        output += data;
+        if (output.includes("启动完成！")) { clearTimeout(timer); resolve(); }
+      });
+    });
+    assert.match(output, /已创建 MYSQL_URL 指定的数据库/);
+    assert.match(output, /MySQL 数据表已初始化/);
+    assert.equal((await fetch(`http://localhost:${apiPort}/api/health`)).status, 200);
+    assert.match(await (await fetch(`http://localhost:${webPort}`)).text(), /\/@vite\/client/);
+    const run = promisify(execFile);
+    const checked = await run("bash", [script, "--check"], { ...options, timeout: 15000 });
+    assert.match(checked.stdout, /MySQL 可连接：true/);
+    assert.match(checked.stdout, new RegExp(`后端 ${apiPort}：reuse`));
+    const reused = await run("bash", [script], { ...options, timeout: 15000 });
+    assert.match(reused.stdout, /前后端原本就已运行，没有重复启动/);
+    assert.equal(child.exitCode, null);
+    await assert.rejects(run("bash", [script], {
+      ...options, env: { ...options.env, WEB_PORT: String(apiServer.address().port) }, timeout: 15000,
+    }), (error) => {
+      assert.equal(error.code, 1);
+      assert.match(error.stderr, /已被其他程序占用/);
+      return true;
+    });
+    assert.equal((await api("/api/health")).status, 200);
+    await stopLauncher();
+    assert.equal((await exited)[0], 143);
+    for (const port of [apiPort, webPort]) {
+      await assert.rejects(fetch(`http://localhost:${port}`, { signal: AbortSignal.timeout(2000) }));
+    }
+    assert.equal((await api("/api/health")).status, 200);
+    const [stillConnected] = await db.query("SELECT 1 AS alive");
+    assert.equal(stillConnected[0].alive, 1);
   });
 
   await t.test("setup, login and role boundaries", async () => {
