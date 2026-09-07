@@ -24,6 +24,20 @@ test("Gemini model and endpoint can be configured without accepting invalid URLs
   for (const url of ["invalid", "file:///tmp/fixture"]) assert.throws(() => readEnvironment({ ...required, GEMINI_BASE_URL: url }));
 });
 
+test("Gemini embeddings default independently of OpenAI and validate model and dimensions", () => {
+  const env = readEnvironment({ ...required, GEMINI_API_KEY: "fixture-key", OPENAI_API_KEY: "", GEMINI_EMBEDDING_MODEL: "", GEMINI_EMBEDDING_DIMENSIONS: " " });
+  assert.equal(env.OPENAI_API_KEY, undefined);
+  assert.equal(env.GEMINI_EMBEDDING_MODEL, "gemini-embedding-2");
+  assert.equal(env.GEMINI_EMBEDDING_DIMENSIONS, 768);
+  const legacy = readEnvironment({ ...required, GEMINI_EMBEDDING_MODEL: "gemini-embedding-001", GEMINI_EMBEDDING_DIMENSIONS: "1536" });
+  assert.equal(legacy.GEMINI_EMBEDDING_MODEL, "gemini-embedding-001");
+  assert.equal(legacy.GEMINI_EMBEDDING_DIMENSIONS, 1536);
+  assert.throws(() => readEnvironment({ ...required, GEMINI_EMBEDDING_MODEL: "gemini-chat-model" }));
+  for (const value of ["0", "127", "3073", "768.5", "invalid"]) {
+    assert.throws(() => readEnvironment({ ...required, GEMINI_EMBEDDING_DIMENSIONS: value }));
+  }
+});
+
 test("database credentials, signing secret and valid port are still required", () => {
   assert.throws(() => readEnvironment({}));
   assert.throws(() => readEnvironment({ ...required, JWT_SECRET: "too-short" }));

@@ -43,6 +43,7 @@ const schema = [
     chunk_index INT UNSIGNED NOT NULL,
     content MEDIUMTEXT NOT NULL,
     embedding JSON NOT NULL,
+    embedding_space VARCHAR(255) NULL,
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     CONSTRAINT fk_chunks_document FOREIGN KEY (document_id) REFERENCES documents(id) ON DELETE CASCADE,
     UNIQUE KEY uq_document_chunk (document_id, chunk_index),
@@ -97,6 +98,15 @@ const schema = [
 
 export async function ensureDatabase() {
   for (const statement of schema) await db.query(statement);
+  const [embeddingColumns] = await db.query<RowDataPacket[]>("SHOW COLUMNS FROM document_chunks LIKE 'embedding_space'");
+  if (!embeddingColumns.length) {
+    try {
+      // Existing vectors deliberately remain unlabelled: never assume their model or dimensions.
+      await db.query("ALTER TABLE document_chunks ADD COLUMN embedding_space VARCHAR(255) NULL");
+    } catch (error) {
+      if (!(error instanceof Error && "code" in error && error.code === "ER_DUP_FIELDNAME")) throw error;
+    }
+  }
   const [providerColumns] = await db.query<RowDataPacket[]>("SHOW COLUMNS FROM messages LIKE 'provider'");
   if (providerColumns[0].Type === "enum('openai','deepseek')") {
     await db.query("ALTER TABLE messages MODIFY COLUMN provider ENUM('openai', 'deepseek', 'gemini') NULL");

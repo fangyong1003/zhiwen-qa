@@ -17,11 +17,12 @@ export function readEnvironment(values: NodeJS.ProcessEnv) {
     ADMIN_NAME: z.preprocess(emptyToUndefined, z.string().min(1).default("系统管理员")),
     OPENAI_API_KEY: optionalString,
     OPENAI_CHAT_MODEL: z.preprocess(emptyToUndefined, z.string().default("gpt-5.6")),
-    OPENAI_EMBEDDING_MODEL: z.preprocess(emptyToUndefined, z.string().default("text-embedding-3-small")),
     DEEPSEEK_API_KEY: optionalString,
     DEEPSEEK_CHAT_MODEL: z.preprocess(emptyToUndefined, z.string().default("deepseek-v4-flash")),
     GEMINI_API_KEY: optionalString,
     GEMINI_CHAT_MODEL: z.preprocess(emptyToUndefined, z.string().default("gemini-3.8-flash")),
+    GEMINI_EMBEDDING_MODEL: z.preprocess(emptyToUndefined, z.enum(["gemini-embedding-2", "gemini-embedding-001"]).default("gemini-embedding-2")),
+    GEMINI_EMBEDDING_DIMENSIONS: z.preprocess(emptyToUndefined, z.coerce.number().int().min(128).max(3072).default(768)),
     GEMINI_BASE_URL: z.preprocess(emptyToUndefined, z.url().refine((value) => ["http:", "https:"].includes(new URL(value).protocol), "GEMINI_BASE_URL must be an HTTP(S) URL").optional()),
   }).superRefine((env, context) => {
     if (Boolean(env.ADMIN_EMAIL) !== Boolean(env.ADMIN_PASSWORD)) {

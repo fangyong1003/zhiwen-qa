@@ -6,6 +6,7 @@ import { db } from "./db";
 import type { Citation, Provider } from "./types";
 import { splitText } from "./chunks";
 import { streamGeminiAnswer } from "./gemini";
+import { cosineSimilarity, createGeminiEmbeddings, embeddingSpace, isEmbeddingVector } from "./embeddings";
 
 type ChunkRow = RowDataPacket & {
   id: string;
@@ -13,12 +14,13 @@ type ChunkRow = RowDataPacket & {
   chunk_index: number;
   content: string;
   embedding: string | number[];
+  embedding_space: string | null;
   title: string;
   filename: string;
 };
 
 function openAIClient() {
-  if (!config.OPENAI_API_KEY) throw new Error("尚未配置 OPENAI_API_KEY；知识库索引需要 OpenAI Embedding 模型。");
+  if (!config.OPENAI_API_KEY) throw new Error("使用 OpenAI 回答需要 OPENAI_API_KEY。请在 .env 中添加后重启服务。");
   return new OpenAI({ apiKey: config.OPENAI_API_KEY });
 }
 
@@ -28,39 +30,16 @@ function deepSeekClient() {
 }
 
 export function assertChatConfigured(provider: Provider) {
-  if (provider === "gemini" && !config.GEMINI_API_KEY) throw new Error("尚未配置 GEMINI_API_KEY。请在 .env 中添加后重启服务。");
+  if (!config.GEMINI_API_KEY) throw new Error("知识库索引和检索需要 GEMINI_API_KEY。请在 .env 中添加后重启服务。");
   if (provider === "deepseek" && !config.DEEPSEEK_API_KEY) throw new Error("尚未配置 DEEPSEEK_API_KEY。请在 .env 中添加后重启服务。");
-  if (!config.OPENAI_API_KEY) throw new Error("知识库检索需要 OPENAI_API_KEY。请在 .env 中添加后重启服务。");
+  if (provider === "openai" && !config.OPENAI_API_KEY) throw new Error("使用 OpenAI 回答需要 OPENAI_API_KEY。请在 .env 中添加后重启服务。");
 }
 
-export async function createEmbeddings(texts: string[]) {
-  const client = openAIClient();
-  const all: number[][] = [];
-  for (let index = 0; index < texts.length; index += 64) {
-    const response = await client.embeddings.create({
-      model: config.OPENAI_EMBEDDING_MODEL,
-      input: texts.slice(index, index + 64),
-      encoding_format: "float",
-    });
-    all.push(...response.data.map((item) => item.embedding));
-  }
-  return all;
-}
-
-function vectorOf(value: string | number[]) {
-  return Array.isArray(value) ? value : JSON.parse(value) as number[];
-}
-
-function cosine(a: number[], b: number[]) {
-  let dot = 0;
-  let left = 0;
-  let right = 0;
-  for (let index = 0; index < Math.min(a.length, b.length); index += 1) {
-    dot += a[index] * b[index];
-    left += a[index] * a[index];
-    right += b[index] * b[index];
-  }
-  return left && right ? dot / Math.sqrt(left * right) : 0;
+function embeddingSettings() {
+  return {
+    apiKey: config.GEMINI_API_KEY, model: config.GEMINI_EMBEDDING_MODEL,
+    dimensions: config.GEMINI_EMBEDDING_DIMENSIONS, baseUrl: config.GEMINI_BASE_URL,
+  };
 }
 
 function lexicalScore(query: string, content: string) {
@@ -71,15 +50,25 @@ function lexicalScore(query: string, content: string) {
 }
 
 export async function retrieve(question: string, limit = 6) {
-  const queryVector = (await createEmbeddings([question]))[0];
+  const settings = embeddingSettings();
   const [rows] = await db.query<ChunkRow[]>(
-    `SELECT c.id, c.document_id, c.chunk_index, c.content, c.embedding, d.title, d.filename
+    `SELECT c.id, c.document_id, c.chunk_index, c.content, c.embedding, c.embedding_space, d.title, d.filename
      FROM document_chunks c INNER JOIN documents d ON d.id = c.document_id
      WHERE d.status = 'ready'`,
   );
-  return rows
-    .map((row) => {
-      const semantic = cosine(queryVector, vectorOf(row.embedding));
+  const expectedSpace = embeddingSpace(settings);
+  const compatibleRows = rows.map((row) => {
+    let vector: unknown;
+    try { vector = typeof row.embedding === "string" ? JSON.parse(row.embedding) : row.embedding; } catch { /* Invalid stored vectors also require reindexing. */ }
+    if (row.embedding_space !== expectedSpace || !isEmbeddingVector(vector, settings.dimensions)) {
+      throw new Error(`文档「${row.title}」的向量与当前 Gemini 配置不兼容，请管理员在知识库管理中重建索引后再提问。`);
+    }
+    return { row, vector };
+  });
+  const queryVector = (await createGeminiEmbeddings(settings, [question], "query"))[0];
+  return compatibleRows
+    .map(({ row, vector }) => {
+      const semantic = cosineSimilarity(queryVector, vector);
       const lexical = lexicalScore(question, row.content);
       return { row, score: semantic * 0.82 + lexical * 0.18 };
     })
@@ -154,15 +143,17 @@ export async function streamAnswer(
 export async function replaceDocumentChunks(documentId: string, content: string) {
   const chunks = splitText(content);
   if (!chunks.length) throw new Error("文档没有可索引的文本内容。");
-  const vectors = await createEmbeddings(chunks);
+  const settings = embeddingSettings();
+  const vectors = await createGeminiEmbeddings(settings, chunks, "document");
+  const space = embeddingSpace(settings);
   const connection = await db.getConnection();
   try {
     await connection.beginTransaction();
     await connection.execute("DELETE FROM document_chunks WHERE document_id = ?", [documentId]);
     for (let index = 0; index < chunks.length; index += 1) {
       await connection.execute(
-        "INSERT INTO document_chunks (id, document_id, chunk_index, content, embedding) VALUES (?, ?, ?, ?, ?)",
-        [randomUUID(), documentId, index, chunks[index], JSON.stringify(vectors[index])],
+        "INSERT INTO document_chunks (id, document_id, chunk_index, content, embedding, embedding_space) VALUES (?, ?, ?, ?, ?, ?)",
+        [randomUUID(), documentId, index, chunks[index], JSON.stringify(vectors[index]), space],
       );
     }
     await connection.execute("UPDATE documents SET status = 'ready', error_message = NULL WHERE id = ?", [documentId]);

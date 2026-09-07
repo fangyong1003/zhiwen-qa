@@ -20,3 +20,25 @@ export function geminiResponse(res, mode = "success") {
   }
   res.end();
 }
+
+export function geminiEmbeddingResponse(res, input, mode = "success") {
+  res.setHeader("Content-Type", "application/json");
+  if (typeof mode === "number") {
+    res.statusCode = mode;
+    return res.end(JSON.stringify({ error: { code: mode, message: "Fixture embedding error: internal details must not reach users", status: "INVALID_ARGUMENT" } }));
+  }
+  const embeddings = input.requests.map((request) => {
+    const text = request.content.parts[0].text;
+    const values = Array(request.outputDimensionality).fill(0);
+    values[0] = 1;
+    values[1] = text.includes("报销") ? 1 : 0;
+    values[2] = text.length / 100;
+    if (mode === "wrong-dimensions") values.pop();
+    if (mode === "invalid-values") values[0] = null;
+    if (mode === "zero-vector") values.fill(0);
+    return { values };
+  });
+  if (mode === "wrong-count") embeddings.pop();
+  if (mode === "missing-vector") embeddings[0] = null;
+  res.end(JSON.stringify({ embeddings }));
+}
