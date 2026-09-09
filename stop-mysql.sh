@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+set -e
+
+brew services stop mysql

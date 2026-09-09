@@ -217,7 +217,7 @@ if [ "$task_web_state" = reuse ]; then
   printf '\n[4/4] 前端已运行：http://localhost:%s\n' "$task_web_port"
 else
   printf '\n[4/4] 正在启动前端…\n'
-  NODE_ENV=development node_modules/.bin/vite --port "$task_web_port" --strictPort &
+  NODE_ENV=development node_modules/.bin/vite --host 0.0.0.0 --port "$task_web_port" --strictPort &
   task_pid=$!; task_child_pids="$task_child_pids $task_pid"
   wait_for_service web "$task_web_port" "$task_pid"
 fi

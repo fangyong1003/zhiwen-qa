@@ -20,7 +20,15 @@ WEB_PORT=3001 ./start.sh # 可选：更换前端端口；后端端口读取 .env
 MYSQL_SERVICE=mysql@8.4 ./start.sh # 仅安装多个 Homebrew MySQL 版本时需要指定
 ```
 
-使用 Docker、非默认端口或远程 MySQL 时，请先启动对应数据库，脚本会直接连接并复用；只有默认本地 3306 端口连接失败时才尝试 Homebrew 启动。也可以继续逐项手动启动：
+关闭本机 Homebrew MySQL：
+
+```bash
+./stop-mysql.sh
+```
+
+脚本直接执行 `brew services stop mysql`，不删除数据库文件，也不关闭前后端进程；所有连接该 MySQL 的项目都会受影响，同时取消该服务的登录自启动。
+
+使用 Docker、非默认端口或远程 MySQL 时，请先启动对应数据库，再运行 `./start.sh`，启动脚本会直接连接并复用；只有默认本地 3306 端口连接失败时才尝试 Homebrew 启动。也可以继续逐项手动启动：
 
 ```bash
 npm install
@@ -32,6 +40,8 @@ npm run dev
 ```
 
 浏览器打开 `http://localhost:3000`。首次启动可用 `.env` 中的 `ADMIN_*` 自动创建管理员；若未填写，也可在登录页创建第一个管理员。
+
+`./start.sh` 和 `npm run dev` 均使用 `vite --host 0.0.0.0`，前端监听所有 IPv4 网卡。同一局域网的设备可通过 `http://<本机局域网 IP>:3000` 访问（使用 `WEB_PORT` 时替换端口），API 请求仍由前端开发服务器代理到后端。已有前端进程需在原终端停止后重新启动才能应用该参数，一键脚本复用旧进程时不会修改监听地址。请仅在可信网络使用，不要将 Vite 开发服务器直接暴露到公网。
 
 请替换模板中的数据库密码与 JWT 密钥。可以用 `node -e "console.log(require('node:crypto').randomBytes(32).toString('hex'))"` 生成 JWT 密钥。`ADMIN_EMAIL` 与 `ADMIN_PASSWORD` 应同时填写或同时留空。
 

@@ -237,6 +237,8 @@ test("MySQL-backed knowledge QA API", { timeout: 90000 }, async (t) => {
     assert.equal((await fetch(`http://localhost:${apiPort}/api/health`)).status, 200);
     assert.match(await (await fetch(`http://localhost:${webPort}`)).text(), /\/@vite\/client/);
     const run = promisify(execFile);
+    const listeners = await run("lsof", ["-nP", `-iTCP:${webPort}`, "-sTCP:LISTEN", "-Fn"], { timeout: 5000 });
+    assert.match(listeners.stdout, new RegExp(`^n\\*:${webPort}$`, "m"), "Frontend must listen on all interfaces, not only localhost");
     const checked = await run("bash", [script, "--check"], { ...options, timeout: 15000 });
     assert.match(checked.stdout, /MySQL 可连接：true/);
     assert.match(checked.stdout, new RegExp(`后端 ${apiPort}：reuse`));

@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
+import fs from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
 import test from "node:test";
@@ -7,6 +8,13 @@ import { promisify } from "node:util";
 
 const run = promisify(execFile);
 const script = path.resolve("start.sh");
+
+test("both frontend startup commands listen on all IPv4 interfaces", async () => {
+  const manifest = JSON.parse(await fs.readFile(path.resolve("package.json"), "utf8"));
+  const launcher = await fs.readFile(script, "utf8");
+  assert.match(manifest.scripts.dev, /"vite --host 0\.0\.0\.0"/);
+  assert.match(launcher, /node_modules\/\.bin\/vite --host 0\.0\.0\.0 --port/);
+});
 
 test("one-click startup script has valid Bash syntax and executable permissions", async () => {
   await run("bash", ["-n", script]);
