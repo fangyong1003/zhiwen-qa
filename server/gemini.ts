@@ -12,6 +12,7 @@ export async function streamGeminiAnswer(
   history: { role: "user" | "assistant"; content: string }[],
   instructions: string,
   onDelta: (text: string) => void,
+  signal?: AbortSignal,
 ) {
   if (!settings.apiKey) throw new Error("尚未配置 GEMINI_API_KEY。请在 .env 中添加后重启服务。");
   const client = new GoogleGenAI({
@@ -29,11 +30,12 @@ export async function streamGeminiAnswer(
         ...recentHistory.map((message) => ({ role: message.role === "assistant" ? "model" : "user", parts: [{ text: message.content }] })),
         { role: "user", parts: [{ text: question }] },
       ],
-      config: { systemInstruction: instructions },
+      config: { systemInstruction: instructions, abortSignal: signal },
     });
     let answer = "";
     let completed = false;
     for await (const chunk of stream) {
+      signal?.throwIfAborted();
       if (chunk.promptFeedback?.blockReason) {
         throw new Error("Gemini 未能处理此问题，请调整提问后重试。");
       }
@@ -50,9 +52,11 @@ export async function streamGeminiAnswer(
       if (finishReason === FinishReason.STOP) completed = true;
     }
     if (!answer.trim()) throw new Error("Gemini 未返回文本回答，请重试。");
+    signal?.throwIfAborted();
     if (!completed) throw new Error("Gemini 响应中断，请重试。");
     return answer;
   } catch (error) {
+    signal?.throwIfAborted();
     if (error instanceof ApiError) {
       if (error.status === 401 || error.status === 403) throw new Error("Gemini 身份验证失败，请检查 GEMINI_API_KEY 及模型访问权限。");
       if (error.status === 404) throw new Error("Gemini 模型不可用，请检查 GEMINI_CHAT_MODEL 配置。");

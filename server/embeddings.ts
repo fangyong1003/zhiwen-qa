@@ -29,7 +29,7 @@ export function cosineSimilarity(a: number[], b: number[]) {
   return a.reduce((sum, value, index) => sum + (value / leftNorm) * (b[index] / rightNorm), 0);
 }
 
-export async function createGeminiEmbeddings(settings: GeminiEmbeddingSettings, texts: string[], task: EmbeddingTask) {
+export async function createGeminiEmbeddings(settings: GeminiEmbeddingSettings, texts: string[], task: EmbeddingTask, signal?: AbortSignal) {
   if (!settings.apiKey) throw new Error("知识库索引和检索需要 GEMINI_API_KEY。请在 .env 中添加后重启服务。");
   if (!texts.length) return [];
   const client = new GoogleGenAI({
@@ -41,6 +41,7 @@ export async function createGeminiEmbeddings(settings: GeminiEmbeddingSettings, 
   const all: number[][] = [];
   try {
     for (let index = 0; index < texts.length; index += 64) {
+      signal?.throwIfAborted();
       const batch = texts.slice(index, index + 64);
       const response = await client.models.embedContent({
         model: settings.model,
@@ -49,6 +50,7 @@ export async function createGeminiEmbeddings(settings: GeminiEmbeddingSettings, 
           text: legacyModel ? text : task === "query" ? `task: question answering | query: ${text}` : `title: none | text: ${text}`,
         }] })),
         config: {
+          abortSignal: signal,
           outputDimensionality: settings.dimensions,
           ...(legacyModel ? { taskType: task === "query" ? "QUESTION_ANSWERING" : "RETRIEVAL_DOCUMENT" } : {}),
         },
@@ -62,6 +64,7 @@ export async function createGeminiEmbeddings(settings: GeminiEmbeddingSettings, 
     }
     return all;
   } catch (error) {
+    signal?.throwIfAborted();
     if (error instanceof ApiError) {
       if (error.status === 401 || error.status === 403) throw new Error("Gemini 向量接口身份验证失败，请检查 GEMINI_API_KEY 及模型访问权限。");
       if (error.status === 404) throw new Error("Gemini 向量模型不可用，请检查 GEMINI_EMBEDDING_MODEL 配置。");

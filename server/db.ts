@@ -66,6 +66,7 @@ const schema = [
     content MEDIUMTEXT NOT NULL,
     provider ENUM('openai', 'deepseek', 'gemini') NULL,
     citations JSON NULL,
+    web_search BOOLEAN NOT NULL DEFAULT FALSE,
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     CONSTRAINT fk_messages_conversation FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE,
     UNIQUE KEY uq_messages_sequence (sequence_no),
@@ -81,6 +82,48 @@ const schema = [
     CONSTRAINT fk_feedback_message FOREIGN KEY (message_id) REFERENCES messages(id) ON DELETE CASCADE,
     CONSTRAINT fk_feedback_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
     UNIQUE KEY uq_feedback_once (message_id, user_id)
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+  `CREATE TABLE IF NOT EXISTS conversation_attachments (
+    id CHAR(36) NOT NULL PRIMARY KEY,
+    conversation_id CHAR(36) NOT NULL,
+    filename VARCHAR(255) NOT NULL,
+    storage_path VARCHAR(500) NOT NULL,
+    size_bytes BIGINT UNSIGNED NOT NULL,
+    status ENUM('parsing','indexing','ready','failed') NOT NULL DEFAULT 'parsing',
+    content MEDIUMTEXT NULL,
+    error_message VARCHAR(1000) NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    CONSTRAINT fk_attachments_conversation FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE,
+    INDEX idx_attachments_conversation (conversation_id)
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+  `CREATE TABLE IF NOT EXISTS attachment_chunks (
+    id CHAR(36) NOT NULL PRIMARY KEY,
+    attachment_id CHAR(36) NOT NULL,
+    chunk_index INT UNSIGNED NOT NULL,
+    content TEXT NOT NULL,
+    embedding JSON NOT NULL,
+    embedding_space VARCHAR(255) NOT NULL,
+    CONSTRAINT fk_private_chunks_attachment FOREIGN KEY (attachment_id) REFERENCES conversation_attachments(id) ON DELETE CASCADE,
+    UNIQUE KEY uq_attachment_chunk (attachment_id, chunk_index)
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+  `CREATE TABLE IF NOT EXISTS conversation_turns (
+    id CHAR(36) NOT NULL PRIMARY KEY,
+    run_token CHAR(36) NULL,
+    conversation_id CHAR(36) NOT NULL,
+    user_message_id CHAR(36) NOT NULL,
+    assistant_message_id CHAR(36) NULL,
+    request JSON NOT NULL,
+    status ENUM('running','completed','failed','cancelled') NOT NULL DEFAULT 'running',
+    partial_content MEDIUMTEXT NOT NULL,
+    error_message VARCHAR(1000) NULL,
+    error_code VARCHAR(50) NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    CONSTRAINT fk_turn_conversation FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE,
+    UNIQUE KEY uq_turn_user_message (user_message_id),
+    UNIQUE KEY uq_turn_assistant_message (assistant_message_id),
+    INDEX idx_turn_conversation (conversation_id, created_at)
   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
   `CREATE TABLE IF NOT EXISTS audit_logs (
     id CHAR(36) NOT NULL PRIMARY KEY,
@@ -98,6 +141,30 @@ const schema = [
 
 export async function ensureDatabase() {
   for (const statement of schema) await db.query(statement);
+  const [turnColumns] = await db.query<RowDataPacket[]>("SHOW COLUMNS FROM conversation_turns LIKE 'run_token'");
+  if (!turnColumns.length) {
+    try { await db.query("ALTER TABLE conversation_turns ADD COLUMN run_token CHAR(36) NULL"); }
+    catch (error) { if (!(error instanceof Error && "code" in error && error.code === "ER_DUP_FIELDNAME")) throw error; }
+  }
+  for (const [name, definition] of [
+    ["active_request_id", "CHAR(36) NULL"], ["active_until", "DATETIME NULL"],
+    ["context_summary", "TEXT NULL"], ["summary_through", "BIGINT UNSIGNED NOT NULL DEFAULT 0"],
+    ["context_reset_sequence", "BIGINT UNSIGNED NOT NULL DEFAULT 0"],
+  ]) {
+    const [columns] = await db.query<RowDataPacket[]>("SHOW COLUMNS FROM conversations LIKE ?", [name]);
+    if (!columns.length) {
+      try { await db.query(`ALTER TABLE conversations ADD COLUMN ${name} ${definition}`); }
+      catch (error) { if (!(error instanceof Error && "code" in error && error.code === "ER_DUP_FIELDNAME")) throw error; }
+    }
+  }
+  const [searchColumns] = await db.query<RowDataPacket[]>("SHOW COLUMNS FROM messages LIKE 'web_search'");
+  if (!searchColumns.length) {
+    try {
+      await db.query("ALTER TABLE messages ADD COLUMN web_search BOOLEAN NOT NULL DEFAULT FALSE");
+    } catch (error) {
+      if (!(error instanceof Error && "code" in error && error.code === "ER_DUP_FIELDNAME")) throw error;
+    }
+  }
   const [embeddingColumns] = await db.query<RowDataPacket[]>("SHOW COLUMNS FROM document_chunks LIKE 'embedding_space'");
   if (!embeddingColumns.length) {
     try {

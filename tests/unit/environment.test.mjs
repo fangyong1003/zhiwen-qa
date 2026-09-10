@@ -24,6 +24,18 @@ test("Gemini model and endpoint can be configured without accepting invalid URLs
   for (const url of ["invalid", "file:///tmp/fixture"]) assert.throws(() => readEnvironment({ ...required, GEMINI_BASE_URL: url }));
 });
 
+test("DeepSeek model and endpoint defaults are separate from Gemini and reject invalid URLs", () => {
+  const defaults = readEnvironment({ ...required, DEEPSEEK_API_KEY: "", DEEPSEEK_CHAT_MODEL: " ", DEEPSEEK_BASE_URL: "" });
+  assert.equal(defaults.DEEPSEEK_API_KEY, undefined);
+  assert.equal(defaults.DEEPSEEK_CHAT_MODEL, "deepseek-v4-flash");
+  assert.equal(defaults.DEEPSEEK_BASE_URL, undefined);
+  assert.equal(defaults.GEMINI_CHAT_MODEL, "gemini-3.8-flash");
+  const custom = readEnvironment({ ...required, DEEPSEEK_CHAT_MODEL: "deepseek-v4-pro", DEEPSEEK_BASE_URL: "http://127.0.0.1:12345/v1" });
+  assert.equal(custom.DEEPSEEK_CHAT_MODEL, "deepseek-v4-pro");
+  assert.equal(custom.DEEPSEEK_BASE_URL, "http://127.0.0.1:12345/v1");
+  for (const url of ["invalid", "file:///tmp/fixture", "ftp://example.invalid"]) assert.throws(() => readEnvironment({ ...required, DEEPSEEK_BASE_URL: url }));
+});
+
 test("Gemini embeddings default independently of OpenAI and validate model and dimensions", () => {
   const env = readEnvironment({ ...required, GEMINI_API_KEY: "fixture-key", OPENAI_API_KEY: "", GEMINI_EMBEDDING_MODEL: "", GEMINI_EMBEDDING_DIMENSIONS: " " });
   assert.equal(env.OPENAI_API_KEY, undefined);

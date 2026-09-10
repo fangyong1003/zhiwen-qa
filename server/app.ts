@@ -14,6 +14,11 @@ import { countUsers, db } from "./db";
 import { extractText, isSupportedFile } from "./documents";
 import { parseJsonColumn } from "./json";
 import type { AuthedRequest, Citation, Provider, Role } from "./types";
+import { attachmentRouter } from "./attachments";
+import { chatTurnRouter, streamChatTurn } from "./chat-turns";
+import { ChatError } from "./chat-errors";
+import { searchWeb } from "./web-search";
+import { usedCitations } from "../shared/citations";
 
 export const app = express();
 app.use(cors({ origin: true, credentials: true }));
@@ -33,8 +38,8 @@ function sendEvent(res: Response, type: string, data: unknown) {
   res.write(`event: ${type}\ndata: ${JSON.stringify(data)}\n\n`);
 }
 
-async function audit(userId: number | null, action: string, targetType?: string, targetId?: string, detail?: unknown) {
-  await db.execute(
+async function audit(userId: number | null, action: string, targetType?: string, targetId?: string, detail?: unknown, executor: Pick<typeof db, "execute"> = db) {
+  await executor.execute(
     "INSERT INTO audit_logs (id, user_id, action, target_type, target_id, detail) VALUES (?, ?, ?, ?, ?, ?)",
     [randomUUID(), userId, action, targetType ?? null, targetId ?? null, detail ? JSON.stringify(detail) : null],
   );
@@ -90,6 +95,17 @@ app.post("/api/auth/logout", requireUser, async (req: AuthedRequest, res, next) 
 
 app.get("/api/auth/me", requireUser, (req: AuthedRequest, res) => res.json({ user: req.user }));
 
+// Browser mutations must originate from this host; CLI clients without Origin still use authentication.
+app.use("/api", (req, res, next) => {
+  if (!["GET", "HEAD", "OPTIONS"].includes(req.method) && req.get("origin")) {
+    try {
+      if (new URL(req.get("origin")!).hostname !== req.hostname) return res.status(403).json({ error: "不允许跨站修改会话。" });
+    } catch { return res.status(403).json({ error: "请求来源无效。" }); }
+  }
+  next();
+});
+app.use("/api", attachmentRouter, chatTurnRouter);
+
 app.get("/api/conversations", requireUser, async (req: AuthedRequest, res, next) => {
   try {
     const [rows] = await db.execute<RowDataPacket[]>(
@@ -105,33 +121,44 @@ app.get("/api/conversations/:id", requireUser, async (req: AuthedRequest, res, n
     const conversationId = String(req.params.id);
     if (!(await ownedConversation(conversationId, req.user!.id))) return res.status(404).json({ error: "对话不存在。" });
     const [messages] = await db.execute<RowDataPacket[]>(
-      "SELECT id, role, content, provider, citations, created_at FROM messages WHERE conversation_id = ? ORDER BY created_at ASC, sequence_no ASC",
-      [conversationId],
+      `SELECT m.id, m.role, m.content, m.provider, m.citations, m.web_search, m.created_at, f.rating AS feedback
+       FROM messages m LEFT JOIN feedback f ON f.message_id = m.id AND f.user_id = ?
+       WHERE m.conversation_id = ? ORDER BY m.created_at ASC, m.sequence_no ASC`,
+      [req.user!.id, conversationId],
     );
-    res.json({ messages: messages.map((message) => ({ ...message, citations: parseJsonColumn<Citation[]>(message.citations, []) })) });
+    res.json({ messages: messages.map((message) => ({ ...message, webSearch: Boolean(message.web_search), citations: usedCitations(message.content, parseJsonColumn<Citation[]>(message.citations, [])) })) });
   } catch (error) { next(error); }
 });
 
 app.post("/api/chat/stream", requireUser, async (req: AuthedRequest, res, next) => {
+  if (Object.hasOwn(req.body ?? {}, "requestId")) return streamChatTurn(req, res, next);
   let streamOpen = false;
   try {
     const input = z.object({
       question: z.string().min(2).max(4000),
       conversationId: z.string().uuid().optional(),
       provider: z.enum(["openai", "deepseek", "gemini"]).default("gemini"),
+      webSearch: z.boolean().default(false),
     }).parse(req.body);
     assertChatConfigured(input.provider);
     const userId = req.user!.id;
     const conversationId = input.conversationId ?? randomUUID();
+    if (input.conversationId) {
+      const [enhanced] = await db.execute<RowDataPacket[]>("SELECT id FROM conversation_turns WHERE conversation_id = ? LIMIT 1", [input.conversationId]);
+      if (enhanced.length) throw new ChatError("此对话需携带 requestId 以保证重试和并发安全。", 400);
+    }
     if (input.conversationId && !(await ownedConversation(conversationId, userId))) return res.status(404).json({ error: "对话不存在。" });
     if (!input.conversationId) {
       const title = input.question.replace(/\s+/g, " ").slice(0, 42);
       await db.execute("INSERT INTO conversations (id, user_id, title) VALUES (?, ?, ?)", [conversationId, userId, title]);
     }
-    await db.execute("INSERT INTO messages (id, conversation_id, role, content) VALUES (?, ?, 'user', ?)", [randomUUID(), conversationId, input.question]);
+    await db.execute("INSERT INTO messages (id, conversation_id, role, content, web_search) VALUES (?, ?, 'user', ?, ?)", [randomUUID(), conversationId, input.question, input.webSearch]);
     await db.execute("UPDATE conversations SET updated_at = CURRENT_TIMESTAMP WHERE id = ?", [conversationId]);
 
-    const context = await retrieve(input.question);
+    const [context, webResult] = await Promise.all([
+      retrieve(input.question),
+      input.webSearch ? searchWeb({ apiKey: config.GEMINI_API_KEY, model: config.GEMINI_CHAT_MODEL, baseUrl: config.GEMINI_BASE_URL }, input.question) : undefined,
+    ]);
     const [historyRows] = await db.execute<RowDataPacket[]>(
       "SELECT role, content FROM messages WHERE conversation_id = ? ORDER BY created_at DESC, sequence_no DESC LIMIT 8",
       [conversationId],
@@ -141,17 +168,19 @@ app.post("/api/chat/stream", requireUser, async (req: AuthedRequest, res, next) 
     res.status(200).set({ "Content-Type": "text/event-stream", "Cache-Control": "no-cache, no-transform", Connection: "keep-alive" });
     res.flushHeaders();
     streamOpen = true;
-    sendEvent(res, "sources", { citations: citationsFrom(context) });
+    // Candidate documents are not confirmed sources until generation is complete.
+    sendEvent(res, "sources", { citations: [], webSearch: input.webSearch, webResult });
     const answer = await streamAnswer(input.provider as Provider, input.question, history, context, (text) => sendEvent(res, "delta", { text }));
     const messageId = randomUUID();
-    const citations = citationsFrom(context);
+    const citations = citationsFrom(context, answer);
     await db.execute(
-      "INSERT INTO messages (id, conversation_id, role, content, provider, citations) VALUES (?, ?, 'assistant', ?, ?, ?)",
-      [messageId, conversationId, answer, input.provider, JSON.stringify(citations)],
+      "INSERT INTO messages (id, conversation_id, role, content, provider, citations, web_search) VALUES (?, ?, 'assistant', ?, ?, ?, ?)",
+      [messageId, conversationId, answer, input.provider, JSON.stringify(citations), input.webSearch],
     );
     await db.execute("UPDATE conversations SET updated_at = CURRENT_TIMESTAMP WHERE id = ?", [conversationId]);
-    await audit(userId, "ask_question", "conversation", conversationId, { provider: input.provider, sources: citations.length });
-    sendEvent(res, "done", { conversationId, messageId, citations });
+    // Search output is shown unchanged to this user only; it is not indexed, persisted, or reused by another model.
+    await audit(userId, "ask_question", "conversation", conversationId, { provider: input.provider, sources: citations.length, ...(input.webSearch ? { webSearch: true, webSources: webResult?.sources.length ?? 0 } : {}) });
+    sendEvent(res, "done", { conversationId, messageId, citations, webSearch: input.webSearch, webResult });
     return res.end();
   } catch (error) {
     if (streamOpen) { sendEvent(res, "error", { error: error instanceof Error ? error.message : "生成回答失败。" }); return res.end(); }
@@ -168,11 +197,26 @@ app.post("/api/feedback", requireUser, async (req: AuthedRequest, res, next) => 
       [input.messageId, req.user!.id],
     );
     if (!messages.length) return res.status(404).json({ error: "回答不存在。" });
-    await db.execute(
-      "INSERT INTO feedback (id, message_id, user_id, rating, note) VALUES (?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE rating = VALUES(rating), note = VALUES(note)",
-      [randomUUID(), input.messageId, req.user!.id, input.rating, input.note ?? null],
-    );
-    await audit(req.user!.id, "feedback", "message", input.messageId, { rating: input.rating });
+    const connection = await db.getConnection();
+    try {
+      await connection.beginTransaction();
+      // The existing unique key makes first-write-wins safe across double clicks and multiple tabs.
+      await connection.execute(
+        "INSERT INTO feedback (id, message_id, user_id, rating, note) VALUES (?, ?, ?, ?, ?)",
+        [randomUUID(), input.messageId, req.user!.id, input.rating, input.note ?? null],
+      );
+      await audit(req.user!.id, "feedback", "message", input.messageId, { rating: input.rating }, connection);
+      await connection.commit();
+    } catch (error) {
+      await connection.rollback();
+      if (error instanceof Error && "code" in error && error.code === "ER_DUP_ENTRY") {
+        const [saved] = await connection.execute<RowDataPacket[]>("SELECT rating FROM feedback WHERE message_id = ? AND user_id = ?", [input.messageId, req.user!.id]);
+        if (saved.length) return res.status(409).json({ error: "该回答已评价，每条回答只能评价一次。", rating: saved[0].rating });
+      }
+      throw error;
+    } finally {
+      connection.release();
+    }
     res.status(204).end();
   } catch (error) { next(error); }
 });
@@ -337,6 +381,7 @@ if (process.env.NODE_ENV === "production") {
 
 app.use((error: unknown, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
   void _next;
+  if (error instanceof ChatError) return res.status(error.status).json({ error: error.message, code: error.code });
   console.error(error);
   if (error instanceof z.ZodError) return res.status(400).json({ error: error.issues[0]?.message ?? "请求参数不正确。" });
   if (error instanceof multer.MulterError) return res.status(400).json({ error: `上传失败：${error.message}` });
